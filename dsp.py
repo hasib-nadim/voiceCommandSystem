@@ -1,10 +1,14 @@
+
+from resemblyzer import VoiceEncoder, preprocess_wav
 import numpy as np
+from pathlib import Path
+
 import noisereduce as nr
-import scipy.signal
-import matplotlib.pyplot as plt
+import scipy.signal 
+
 def clearNoise(arr):
 	reduced_noise = nr.reduce_noise(y=arr, sr=16000)
-	return reduced_noise * 2
+	return reduced_noise  * 0.90  # to avoid clipping
 
 
 def max_normalized_cross_correlation(a, b):
@@ -16,18 +20,11 @@ def max_normalized_cross_correlation(a, b):
     - -1 indicates a perfect inverse match.
     - 0 indicates no linear relationship.
     """
-
-    signal_a = (a - np.mean(a)) / np.std(a)
-    signal_b = (b - np.mean(b)) / np.std(b)
-
-    correlation = scipy.signal.correlate(signal_b, signal_a, mode='full')
-   
-    # Normalize by length to get correlation coefficient range
-    norm_factor = len(signal_a)
-    correlation /= norm_factor
-
-    # Find max correlation and corresponding lag
-    max_corr = np.max(correlation)
-    lag = np.argmax(correlation) - len(signal_a) + 1
-
-    return max_corr, lag
+    encoder = VoiceEncoder()
+    emb_a = encoder.embed_utterance(a)
+    emb_b = encoder.embed_utterance(b)
+    a = emb_a.flatten()
+    b = emb_b.flatten()
+    similarity = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    max_corr = similarity
+    return max_corr, 0

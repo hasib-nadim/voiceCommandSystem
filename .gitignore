@@ -1,3 +1,5 @@
 .venv
 sample
 samplex
+chunk
+__pycache__/

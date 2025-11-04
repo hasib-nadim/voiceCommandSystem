@@ -2,442 +2,583 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import sys
-from pathlib import Path
-import librosa
-# PyQt5 UI
-from PyQt5 import QtWidgets, QtCore
-from PyQt5.QtCore import pyqtSignal
-
-# Matplotlib for plotting
-import matplotlib
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
-import sys
-from pathlib import Path
+from pathlib import Path 
 import json
-import concurrent.futures
 
-# PyQt5 UI
-from PyQt5 import QtWidgets, QtCore
-from PyQt5.QtCore import pyqtSignal
+from PyQt5 import QtWidgets, QtCore, QtGui
+from PyQt5.QtCore import pyqtSignal, Qt
 
-# Matplotlib for plotting
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+from resemblyzer import VoiceEncoder, preprocess_wav
 import dsp
-import sys, subprocess, webbrowser
 
-class Recorder(QtCore.QObject):
-    """Non-blocking recorder using sounddevice callback and soundfile.
-    Emits signals for status updates so UI can stay responsive.
-    """
-    finished = QtCore.pyqtSignal(str)
-    error = QtCore.pyqtSignal(str)
 
-    def __init__(self, samplerate=16000, channels=1, parent=None):
+class VoiceCommandCard(QtWidgets.QWidget):
+    """Compact card for voice command."""
+    record_toggled = pyqtSignal(bool, int)
+    
+    def __init__(self, index, parent=None):
         super().__init__(parent)
-        self.samplerate = samplerate
-        self.channels = channels
-        self._file = None
-        self._stream = None
+        self.index = index
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        self.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2d2d2d, stop:1 #252525);
+                border-radius: 10px;
+                border: 1px solid #3a3a3a;
+            }
+        """)
+        
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+        
+        # Header with status
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel(f"Voice {self.index + 1}")
+        title.setStyleSheet("font-size: 13px; font-weight: bold; color: #fff;")
+        self.status_dot = QtWidgets.QLabel("○")
+        self.status_dot.setStyleSheet("color: #666; font-size: 18px;")
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.status_dot)
+        layout.addLayout(header)
+        
+        # Command combo
+        self.combo = QtWidgets.QComboBox()
+        self.combo.addItems(['open_calculator', 'open_notepad', 'open_browser', 
+                            'on_light', 'off_light', 'custom'])
+        self.combo.setStyleSheet("""
+            QComboBox {
+                background-color: #1a1a1a;
+                color: #fff;
+                border: 1px solid #444;
+                border-radius: 5px;
+                padding: 6px 8px;
+                font-size: 12px;
+            }
+            QComboBox:hover { border-color: #2196F3; }
+            QComboBox::drop-down { border: none; width: 20px; }
+            QComboBox::down-arrow { 
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #888;
+                margin-right: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1a1a1a;
+                color: #fff;
+                selection-background-color: #2196F3;
+                border: 1px solid #444;
+            }
+        """)
+        layout.addWidget(self.combo)
+        
+        # Record button
+        self.record_btn = QtWidgets.QPushButton("🎤 Record")
+        self.record_btn.setCheckable(True)
+        self.record_btn.toggled.connect(self._on_record)
+        self.record_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2196F3, stop:1 #1976D2);
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #42A5F5, stop:1 #2196F3);
+            }
+            QPushButton:checked {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #f44336, stop:1 #d32f2f);
+            }
+        """)
+        layout.addWidget(self.record_btn)
+    
+    def _on_record(self, checked):
+        if checked:
+            self.record_btn.setText("⏹ Stop")
+            self.set_status("recording", "#ff9800")
+        else:
+            self.record_btn.setText("🎤 Record")
+        self.record_toggled.emit(checked, self.index)
+    
+    def set_status(self, status, color="#4CAF50"):
+        self.status_dot.setStyleSheet(f"color: {color}; font-size: 18px;")
+        if status == "saved":
+            self.status_dot.setText("✓")
+        elif status == "recording":
+            self.status_dot.setText("●")
+        else:
+            self.status_dot.setText("○")
 
-    def start(self, filename: str):
-        try:
-            Path(filename).parent.mkdir(parents=True, exist_ok=True)
-            self._file = sf.SoundFile(filename, mode='w', samplerate=self.samplerate, channels=self.channels, subtype='PCM_16')
 
-            def callback(indata, frames, time, status):
-                if status:
-                    # forward status as error text
-                    self.error.emit(str(status))
-                # write frames (convert to 2D if needed)
-                self._file.write(indata.copy())
-
-            self._stream = sd.InputStream(samplerate=self.samplerate, channels=self.channels, callback=callback)
-            self._stream.start()
-        except Exception as e:
-            self.error.emit(str(e))
-
-    def stop(self):
-        try:
-            if self._stream is not None:
-                self._stream.stop()
-                self._stream.close()
-                self._stream = None
-            if self._file is not None:
-                filename = self._file.name
-                self._file.close()
-                self._file = None
-                self.finished.emit(filename)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class ChunkRecorder(QtCore.QThread):
-    """Continuous recorder thread that reads small frames from an InputStream and emits them.
-    Emits numpy 1-D float32 arrays via chunk_ready signal.
-    """
-    chunk_ready = pyqtSignal(object)  # emits numpy array or None on error
-
-    def __init__(self, frames_per_buffer=64, samplerate=16000, channels=1, parent=None):
-        super().__init__(parent)
-        self.frames_per_buffer = int(frames_per_buffer)
-        self.samplerate = int(samplerate)
-        self.channels = int(channels)
+class AudioBuffer(QtCore.QThread):
+    def __init__(self, duration=5.0, sr=16000):
+        super().__init__()
+        self.sr = sr
+        self.buffer_size = int(sr * duration)
+        self.buffer = np.zeros(self.buffer_size, dtype=np.float32)
+        self.pos = 0
+        self.lock = QtCore.QMutex()
         self._running = False
-        self._stream = None
 
     def run(self):
         self._running = True
-        try:
-            with sd.InputStream(samplerate=self.samplerate, channels=self.channels, dtype='float32', blocksize=self.frames_per_buffer) as stream:
-                self._stream = stream
-                while self._running:
-                    try:
-                        data, overflow = stream.read(self.frames_per_buffer)
-                        arr = np.asarray(data, dtype=np.float32).reshape(-1)
-                        self.chunk_ready.emit(arr)
-                    except Exception:
-                        self.chunk_ready.emit(None)
-                        break
-        except Exception:
-            self.chunk_ready.emit(None)
-        finally:
-            self._stream = None
+        with sd.InputStream(samplerate=self.sr, channels=1, dtype='float32', blocksize=1024) as stream:
+            while self._running:
+                data, _ = stream.read(1024)
+                arr = data.reshape(-1)
+                
+                self.lock.lock()
+                n = len(arr)
+                if self.pos + n <= self.buffer_size:
+                    self.buffer[self.pos:self.pos + n] = arr
+                else:
+                    first = self.buffer_size - self.pos
+                    self.buffer[self.pos:] = arr[:first]
+                    self.buffer[:n - first] = arr[first:]
+                self.pos = (self.pos + n) % self.buffer_size
+                self.lock.unlock()
+
+    def get_audio(self, duration=3.0):
+        samples = int(self.sr * duration)
+        samples = min(samples, self.buffer_size)
+        
+        self.lock.lock()
+        if self.pos >= samples:
+            result = self.buffer[self.pos - samples:self.pos].copy()
+        else:
+            result = np.concatenate([
+                self.buffer[-(samples - self.pos):],
+                self.buffer[:self.pos]
+            ])
+        self.lock.unlock()
+        return result
 
     def stop(self):
         self._running = False
-        try:
-            if self._stream is not None:
-                try:
-                    self._stream.abort()
-                except Exception:
-                    pass
-        finally:
-            self.wait(2000)
+        self.wait(2000)
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    process_result = pyqtSignal(object)
-
+    detection = pyqtSignal(object)
+    
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Voice Command Recorder')
+        self.setWindowTitle('Voice Command System')
+        
+        # Data
+        self.encoder = VoiceEncoder()
+        self.embeddings = [None, None, None]
+        self.audio_buffer = None
+        self.last_detection = {}
+        
+        self._setup_ui()
+        self._load_saved_commands()
+        
+        # Timers
+        self.process_timer = QtCore.QTimer()
+        self.process_timer.timeout.connect(self._process)
+        self.viz_timer = QtCore.QTimer()
+        self.viz_timer.timeout.connect(self._update_viz)
+        self.detection.connect(self._on_detection)
+
+    def _setup_ui(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1a1a1a;
+            }
+            QLabel { color: #fff; }
+        """)
+        
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
-
-        # three record rows
-        self.record_buttons = []
-        self.combo_boxes = []
-        self.status_labels = []
-        self.recorders = []
-        self.voiceComands = []
-
-        Path('sample').mkdir(parents=True, exist_ok=True)
-
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Header
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("🎙️ Voice Commands")
+        title.setStyleSheet("""
+            font-size: 20px; 
+            font-weight: bold; 
+            color: #2196F3;
+            padding: 5px;
+        """)
+        header.addWidget(title)
+        header.addStretch()
+        main_layout.addLayout(header)
+        
+        # Command cards in row
+        cards_layout = QtWidgets.QHBoxLayout()
+        cards_layout.setSpacing(10)
+        self.cards = []
         for i in range(3):
-            row = QtWidgets.QHBoxLayout()
-            btn = QtWidgets.QPushButton(f'Record voice {i+1}')
-            combo = QtWidgets.QComboBox()
-            combo.addItems(['open_calculator', 'open_notepad', 'open_browser', 'on_light', 'off_light', 'custom'])
-            fname = f'sample/voice_{i+1}.wav'
-            status_text = 'saved' if Path(fname).exists() else 'idle'
-            if(status_text == 'saved'):
-                data, _ = librosa.load(fname, sr=16000, mono=True)
-                self.voiceComands.append(dsp.clearNoise(data))
-            status = QtWidgets.QLabel(status_text)
-            row.addWidget(btn)
-            row.addWidget(combo)
-            row.addWidget(status)
-            layout.addLayout(row)
-
-            self.record_buttons.append(btn)
-            self.combo_boxes.append(combo)
-            self.status_labels.append(status)
-
-            rec = Recorder()
-            rec.finished.connect(self._on_finished)
-            rec.error.connect(self._on_error)
-            self.recorders.append(rec)
-
-            btn.setCheckable(True)
-            btn.toggled.connect(lambda checked, idx=i: self.toggle_record(checked, idx))
-
-        # bindings file
-        self.bindings_file = Path('sample/voice_bindings.json')
-        self._load_bindings()
-        for i, combo in enumerate(self.combo_boxes):
-            combo.currentIndexChanged.connect(lambda _idx, j=i: self._save_bindings())
-
-        # Start Listening button
-        self.listen_btn = QtWidgets.QPushButton('Start Listening')
-        layout.addWidget(self.listen_btn)
+            card = VoiceCommandCard(i)
+            card.record_toggled.connect(self._on_record)
+            card.combo.currentIndexChanged.connect(self._save_bindings)
+            self.cards.append(card)
+            cards_layout.addWidget(card)
+        main_layout.addLayout(cards_layout)
+        
+        # Control panel
+        control_panel = QtWidgets.QWidget()
+        control_panel.setStyleSheet("""
+            QWidget {
+                background: #222;
+                border-radius: 8px;
+                border: 1px solid #333;
+            }
+        """)
+        control_layout = QtWidgets.QHBoxLayout(control_panel)
+        control_layout.setContentsMargins(12, 10, 12, 10)
+        control_layout.setSpacing(15)
+        
+        # Threshold slider
+        thresh_label = QtWidgets.QLabel("Threshold:")
+        thresh_label.setStyleSheet("font-size: 12px; color: #aaa;")
+        control_layout.addWidget(thresh_label)
+        
+        self.threshold_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.threshold_slider.setMinimum(40)
+        self.threshold_slider.setMaximum(75)
+        self.threshold_slider.setValue(55)
+        self.threshold_slider.setFixedWidth(150)
+        self.threshold_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #333;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2196F3, stop:1 #1976D2);
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+                border: 2px solid #0d47a1;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #42A5F5;
+            }
+        """)
+        control_layout.addWidget(self.threshold_slider)
+        
+        self.threshold_label = QtWidgets.QLabel("0.55")
+        self.threshold_label.setStyleSheet("font-size: 13px; color: #2196F3; font-weight: bold; min-width: 40px;")
+        self.threshold_slider.valueChanged.connect(
+            lambda v: self.threshold_label.setText(f'{v/100:.2f}')
+        )
+        control_layout.addWidget(self.threshold_label)
+        
+        control_layout.addStretch()
+        
+        # Listen button
+        self.listen_btn = QtWidgets.QPushButton("🎧 Start Listening")
         self.listen_btn.setCheckable(True)
-
-        # Matplotlib canvas for waveform (initially empty)
-        self.fig = Figure(figsize=(6, 5))
-        self.canvas = FigureCanvas(self.fig)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title('Live waveform')
-        self.ax.set_xlabel('Samples')
-        self.ax.set_ylabel('Amplitude')
-        layout.addWidget(self.canvas)
-
-        # chunk recorder thread placeholder
-        self.chunk_thread = None
         self.listen_btn.toggled.connect(self._toggle_listen)
-
-        # Log area (compact, scrollable)
+        self.listen_btn.setFixedHeight(36)
+        self.listen_btn.setFixedWidth(160)
+        self.listen_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4CAF50, stop:1 #388E3C);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #66BB6A, stop:1 #4CAF50);
+            }
+            QPushButton:checked {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #f44336, stop:1 #d32f2f);
+            }
+        """)
+        control_layout.addWidget(self.listen_btn)
+        
+        main_layout.addWidget(control_panel)
+        
+        # Graph
+        self.fig = Figure(figsize=(8, 2.5), facecolor='#1a1a1a')
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setStyleSheet("background-color: #1a1a1a; border-radius: 8px;")
+        self.ax = self.fig.add_subplot(111, facecolor='#222')
+        self.ax.set_title('Detection Scores', color='#fff', fontsize=13, pad=8, fontweight='bold')
+        self.ax.set_xlabel('Commands', color='#888', fontsize=10)
+        self.ax.set_ylabel('Similarity', color='#888', fontsize=10)
+        self.ax.tick_params(colors='#888', labelsize=9)
+        self.ax.grid(True, alpha=0.1, color='#444')
+        for spine in self.ax.spines.values():
+            spine.set_color('#333')
+        self.ax.set_ylim(0, 1)
+        self.fig.tight_layout(pad=2)
+        main_layout.addWidget(self.canvas)
+        self._update_detection_graph([0, 0, 0], None)
+        
+        # Log
         self.log = QtWidgets.QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        self.log.setFixedHeight(220)
-        self.log.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        layout.addWidget(QtWidgets.QLabel('Log'))
-        layout.addWidget(self.log)
+        self.log.setMaximumHeight(100)
+        self.log.setStyleSheet("""
+            QTextEdit {
+                background-color: #222;
+                color: #ccc;
+                border: 1px solid #333;
+                border-radius: 6px;
+                padding: 8px;
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                font-size: 11px;
+            }
+        """)
+        main_layout.addWidget(self.log)
 
-        # background processing executor
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        self.process_result.connect(self._on_process_result)
-
-        # plotting buffer (5s)
-        self._plot_buffer_len = 5 * 16000
-        self._plot_buffer = np.zeros(self._plot_buffer_len, dtype=np.float32)
-        self._plot_head = 0
-
-
-    def _toggle_listen(self, checked: bool):
-        if checked:
-            if self.chunk_thread is None or not self.chunk_thread.isRunning():
-                self.chunk_thread = ChunkRecorder(frames_per_buffer=16000 * 3, samplerate=16000, channels=1)
-                self.chunk_thread.chunk_ready.connect(self._on_chunk)
-                self.chunk_thread.start()
-                self.log_msg('Started continuous listening')
-                self.listen_btn.setText('Stop Listening')
-        else:
-            if self.chunk_thread is not None:
+    def _load_saved_commands(self):
+        Path('sample').mkdir(exist_ok=True)
+        Path('chunk').mkdir(exist_ok=True)
+        
+        for i in range(3):
+            fname = f'sample/voice_{i+1}.wav'
+            if Path(fname).exists():
                 try:
-                    self.chunk_thread.stop()
-                    self.chunk_thread.wait(1000)
-                except Exception:
-                    pass
-                self.chunk_thread = None
-            self.log_msg('Stopped continuous listening')
-            self.listen_btn.setText('Start Listening')
-
-    def _on_chunk(self, arr):
-        if arr is None:
-            self.log_msg('Error while recording chunk')
-            return
-        # submit processing to executor (safe, bounded)
-        try:
-            data_copy = np.array(arr, copy=True)
-            # submit a processing job for each stored voice command
-            for idx, vc in enumerate(self.voiceComands):
-                self._executor.submit(self._process_chunk, data_copy, vc, idx)
-        except Exception:
-            # fallback synchronous: process each command inline
-            for idx, vc in enumerate(self.voiceComands):
-                self._process_chunk(np.array(arr, copy=True), vc, idx)
-
-        # append to rolling buffer and plot last window
-        n = len(arr)
-        if n == 0:
-            return
-        if n >= self._plot_buffer_len:
-            self._plot_buffer = arr[-self._plot_buffer_len :].astype(np.float32)
-            self._plot_head = 0
-        else:
-            end = self._plot_head + n
-            if end <= self._plot_buffer_len:
-                self._plot_buffer[self._plot_head:end] = arr.astype(np.float32)
-                self._plot_head = end % self._plot_buffer_len
-            else:
-                first = self._plot_buffer_len - self._plot_head
-                self._plot_buffer[self._plot_head:] = arr[:first].astype(np.float32)
-                self._plot_buffer[: n - first] = arr[first:].astype(np.float32)
-                self._plot_head = (n - first)
-
-        plot_window = min(self._plot_buffer_len, 5 * 16000)
-        head = self._plot_head
-        if head == 0:
-            view = self._plot_buffer[-plot_window:]
-        else:
-            if head >= plot_window:
-                view = self._plot_buffer[head - plot_window : head]
-            else:
-                view = np.concatenate((self._plot_buffer[-(plot_window - head):], self._plot_buffer[:head]))
-        view = dsp.clearNoise(view)
-        self.ax.clear()
-        self.ax.plot(view, linewidth=0.5)
-        self.ax.set_xlim(0, len(view))
-        self.ax.set_ylim(-1.0, 1.0)
-        self.canvas.draw()
-
-    def _process_chunk(self, arr, commandArr, commandIdx):
-        # runs in worker thread; schedule result emit on main thread via QTimer.singleShot
-        try:
-            if arr is None:
-                result = {'error': 'no data'}
-            else:
-                rating, lag = dsp.max_normalized_cross_correlation(arr,commandArr)
-        except Exception as e:
-            result = {'error': str(e)}
-
-        # emit signal (Qt will queue the signal delivery to the main thread)
-        try:
-            self.process_result.emit((rating, lag, commandIdx))
-        except Exception:
-            # fallback: schedule via singleShot if direct emit fails
+                    audio = preprocess_wav(fname)
+                    clean = dsp.clearNoise(audio)
+                    self.embeddings[i] = self.encoder.embed_utterance(clean)
+                    self.cards[i].set_status("saved", "#4CAF50")
+                    self.log_msg(f'✓ Loaded voice {i+1}')
+                except Exception as e:
+                    self.log_msg(f'✗ Error loading voice {i+1}: {e}')
+        
+        bindings_file = Path('sample/voice_bindings.json')
+        if bindings_file.exists():
             try:
-                QtCore.QTimer.singleShot(0, lambda r=(rating, lag, commandIdx): self.process_result.emit(r))
-            except Exception:
-                pass
-
-    def _on_process_result(self, data):
-        rating, lag, commandIdx = data
-        if(rating >= 0.3):
-            # get command name from commandIdx
-            try:
-                cmd_name = self.combo_boxes[commandIdx].currentText()
-            except Exception:
-                cmd_name = None
-
-            if cmd_name:
-                self.log_msg(f"Detected command '{cmd_name}' (idx={commandIdx+1}) rating={rating:.2f} lag={lag}")
-                # try:
-                #     if cmd_name == 'open_calculator':
-                #         if sys.platform.startswith('win'):
-                #             subprocess.Popen(['calc.exe'])
-                #         elif sys.platform.startswith('darwin'):
-                #             subprocess.Popen(['open', '-a', 'Calculator'])
-                #         else:
-                #             subprocess.Popen(['gnome-calculator'])
-                #     elif cmd_name == 'open_notepad':
-                #         if sys.platform.startswith('win'):
-                #             subprocess.Popen(['notepad.exe'])
-                #         elif sys.platform.startswith('darwin'):
-                #             subprocess.Popen(['open', '-a', 'TextEdit'])
-                #         else:
-                #             # fallback to common editors
-                #             for cmd in (['gedit'], ['kate'], ['xed'], ['nano']):
-                #                 try:
-                #                     subprocess.Popen(cmd)
-                #                     break
-                #                 except Exception:
-                #                     continue
-                #     elif cmd_name == 'open_browser':
-                #         webbrowser.open('http://www.google.com')
-                #     elif cmd_name == 'on_light':
-                #         # placeholder: integrate with actual IoT/API
-                #         self.log_msg('Action: turn light ON (placeholder)')
-                #     elif cmd_name == 'off_light':
-                #         self.log_msg('Action: turn light OFF (placeholder)')
-                #     else:
-                #         # custom or unknown command
-                #         self.log_msg(f'Custom command selected: {cmd_name}')
-                # except Exception as e:
-                #     self.log_msg(f'Failed to execute command {cmd_name}: {e}')
-             
-
-
-    def log_msg(self, msg: str):
-        # append and keep scrolled to end
-        self.log.append(msg)
-        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
-
-    def toggle_record(self, checked: bool, idx: int):
-        btn = self.record_buttons[idx]
-        status = self.status_labels[idx]
-        recorder = self.recorders[idx]
-        filename = f'sample/voice_{idx+1}.wav'
-        if checked:
-            status.setText('recording...')
-            self.log_msg(f'Started recording {filename}')
-            recorder.start(filename)
-            btn.setText('Stop')
-        else:
-            recorder.stop()
-            btn.setText(f'Record voice {idx+1}')
-            status.setText('stopping...')
-            data, _ = librosa.load(filename, sr=16000, mono=True)
-            self.voiceComands.insert(idx,dsp.clearNoise(data))
-
-    def _on_finished(self, filename: str):
-        try:
-            p = Path(filename)
-            name = p.name
-            for i in range(len(self.status_labels)):
-                if name == f'voice_{i+1}.wav':
-                    self.status_labels[i].setText('saved')
-                    self.log_msg(f'Saved {filename}')
-                    return
-        except Exception:
-            pass
-        self.log_msg(f'Recording finished: {filename}')
-
-    def _on_error(self, text: str):
-        self.log_msg(f'Error: {text}')
-
-    def _load_bindings(self):
-        try:
-            if self.bindings_file.exists():
-                data = json.loads(self.bindings_file.read_text())
-                for i, combo in enumerate(self.combo_boxes):
+                data = json.loads(bindings_file.read_text())
+                for i, card in enumerate(self.cards):
                     key = f'voice_{i+1}'
                     if key in data:
-                        val = data[key]
-                        idx = combo.findText(val)
+                        idx = card.combo.findText(data[key])
                         if idx != -1:
-                            combo.setCurrentIndex(idx)
+                            card.combo.setCurrentIndex(idx)
+            except:
+                pass
+
+    def _on_record(self, checked, idx):
+        if checked:
+            fname = f'sample/voice_{idx+1}.wav'
+            Path(fname).parent.mkdir(exist_ok=True)
+            
+            self._rec_file = sf.SoundFile(fname, mode='w', samplerate=16000, 
+                                          channels=1, subtype='PCM_16')
+            
+            def callback(indata, frames, time, status):
+                self._rec_file.write(indata.copy())
+            
+            self._rec_stream = sd.InputStream(samplerate=16000, channels=1, callback=callback)
+            self._rec_stream.start()
+            self.log_msg(f'🎤 Recording voice {idx+1}...')
+        else:
+            if hasattr(self, '_rec_stream'):
+                self._rec_stream.stop()
+                self._rec_stream.close()
+            if hasattr(self, '_rec_file'):
+                fname = self._rec_file.name
+                self._rec_file.close()
+                
+                try:
+                    audio = preprocess_wav(fname)
+                    clean = dsp.clearNoise(audio)
+                    self.embeddings[idx] = self.encoder.embed_utterance(clean)
+                    self.cards[idx].set_status("saved", "#4CAF50")
+                    self.log_msg(f'✓ Saved voice {idx+1}')
+                except Exception as e:
+                    self.log_msg(f'✗ Error: {e}')
+
+    def _toggle_listen(self, checked):
+        if checked:
+            self.audio_buffer = AudioBuffer(duration=5.0, sr=16000)
+            self.audio_buffer.start()
+            self.process_timer.start(250)
+            self.viz_timer.start(100)
+            self.listen_btn.setText("⏹ Stop")
+            self.log_msg('🎧 Listening started')
+        else:
+            self.process_timer.stop()
+            self.viz_timer.stop()
+            if self.audio_buffer:
+                self.audio_buffer.stop()
+                self.audio_buffer = None
+            self.listen_btn.setText("🎧 Start Listening")
+            self.log_msg('⏹ Stopped')
+
+    def _process(self):
+        if not self.audio_buffer:
+            return
+        
+        audio = self.audio_buffer.get_audio(2.5)
+        if len(audio) < 8000:
+            return
+        
+        energy = np.sqrt(np.mean(audio ** 2))
+        if energy < 0.005:
+            return
+        
+        active_commands = [i for i, emb in enumerate(self.embeddings) if emb is not None]
+        if not active_commands:
+            return
+        
+        try:
+            clean = dsp.clearNoise(audio)
+            current_embed = self.encoder.embed_utterance(preprocess_wav(clean))
+            
+            similarities = []
+            for idx in range(3):
+                if self.embeddings[idx] is not None:
+                    sim = np.dot(current_embed, self.embeddings[idx]) / (
+                        np.linalg.norm(current_embed) * np.linalg.norm(self.embeddings[idx]) + 1e-8
+                    )
+                    similarities.append(sim)
+                else:
+                    similarities.append(0.0)
+            
+            self._update_detection_graph(similarities, None)
+            
+            min_threshold = self.threshold_slider.value() / 100.0
+            max_sim = max(similarities)
+            
+            if max_sim >= min_threshold:
+                best_idx = similarities.index(max_sim)
+                self.detection.emit((best_idx, max_sim, similarities))
+                
         except Exception as e:
-            self.log_msg(f'Failed to load bindings: {e}')
+            self.log_msg(f'⚠ Process error: {e}')
+
+    def _on_detection(self, data):
+        cmd_idx, similarity, all_scores = data
+        
+        import time
+        current_time = time.time()
+        
+        if cmd_idx in self.last_detection:
+            if current_time - self.last_detection[cmd_idx] < 2.0:
+                return
+        
+        self.last_detection[cmd_idx] = current_time
+        cmd = self.cards[cmd_idx].combo.currentText()
+        
+        self.cards[cmd_idx].set_status("saved", "#00ff00")
+        QtCore.QTimer.singleShot(500, lambda: self.cards[cmd_idx].set_status("saved", "#4CAF50"))
+        
+        self._update_detection_graph(all_scores, cmd_idx)
+        
+        scores_str = " | ".join([f"V{i+1}:{s:.2f}" for i, s in enumerate(all_scores)])
+        self.log_msg(f'✓ {cmd} (Voice {cmd_idx+1}) [{scores_str}]')
+
+    def _update_detection_graph(self, similarities, winner_idx):
+        self.ax.clear()
+        
+        colors = ['#2196F3', '#FFC107', '#9C27B0']
+        if winner_idx is not None:
+            colors[winner_idx] = '#4CAF50'
+        
+        bars = self.ax.bar(
+            ['V1', 'V2', 'V3'],
+            similarities,
+            color=colors,
+            edgecolor='#fff',
+            linewidth=1.2,
+            alpha=0.9
+        )
+        
+        for i, (bar, sim) in enumerate(zip(bars, similarities)):
+            height = bar.get_height()
+            label = f'{sim:.3f}'
+            if i == winner_idx:
+                label = f'✓ {label}'
+            self.ax.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                        label, ha='center', va='bottom', color='#fff', 
+                        fontweight='bold', fontsize=10)
+        
+        threshold = self.threshold_slider.value() / 100.0
+        self.ax.axhline(y=threshold, color='#f44336', linestyle='--', linewidth=1.5, 
+                       alpha=0.8, label=f'Threshold ({threshold:.2f})')
+        
+        self.ax.set_ylim(0, 1.0)
+        self.ax.set_ylabel('Similarity', color='#888', fontsize=10)
+        self.ax.set_xlabel('Commands', color='#888', fontsize=10)
+        self.ax.set_title('Detection Scores', color='#fff', fontsize=13, pad=8, fontweight='bold')
+        self.ax.tick_params(colors='#888', labelsize=9)
+        self.ax.grid(True, alpha=0.1, color='#444', linestyle='-', linewidth=0.5)
+        self.ax.legend(loc='upper right', facecolor='#222', edgecolor='#333', 
+                      labelcolor='#fff', fontsize=8, framealpha=0.9)
+        
+        for spine in self.ax.spines.values():
+            spine.set_color('#333')
+        
+        self.fig.tight_layout(pad=2)
+        self.canvas.draw()
+
+    def _update_viz(self):
+        pass
 
     def _save_bindings(self):
         try:
-            data = {}
-            for i, combo in enumerate(self.combo_boxes):
-                data[f'voice_{i+1}'] = combo.currentText()
-            self.bindings_file.write_text(json.dumps(data, indent=2))
-            # silent save (no spam) - keep optional log
-        except Exception as e:
-            self.log_msg(f'Failed to save bindings: {e}')
+            data = {f'voice_{i+1}': card.combo.currentText() 
+                    for i, card in enumerate(self.cards)}
+            Path('sample/voice_bindings.json').write_text(json.dumps(data, indent=2))
+        except:
+            pass
+
+    def log_msg(self, msg):
+        self.log.append(msg)
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def closeEvent(self, event):
-        # stop continuous recording thread and shutdown executor
-        try:
-            if self.chunk_thread is not None and self.chunk_thread.isRunning():
-                try:
-                    self.chunk_thread.stop()
-                except Exception:
-                    pass
-                try:
-                    self.chunk_thread.wait(1000)
-                except Exception:
-                    pass
-                self.chunk_thread = None
-        except Exception:
-            pass
-        try:
-            if hasattr(self, '_executor'):
-                try:
-                    self._executor.shutdown(wait=False)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        if self.listen_btn.isChecked():
+            self.listen_btn.setChecked(False)
         super().closeEvent(event)
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow()
-    w.resize(700, 600)
-    w.show()
+    app.setStyle('Fusion')
+    
+    palette = QtGui.QPalette()
+    palette.setColor(QtGui.QPalette.Window, QtGui.QColor(26, 26, 26))
+    palette.setColor(QtGui.QPalette.WindowText, QtCore.Qt.white)
+    palette.setColor(QtGui.QPalette.Base, QtGui.QColor(34, 34, 34))
+    palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(26, 26, 26))
+    palette.setColor(QtGui.QPalette.ToolTipBase, QtCore.Qt.white)
+    palette.setColor(QtGui.QPalette.ToolTipText, QtCore.Qt.white)
+    palette.setColor(QtGui.QPalette.Text, QtCore.Qt.white)
+    palette.setColor(QtGui.QPalette.Button, QtGui.QColor(34, 34, 34))
+    palette.setColor(QtGui.QPalette.ButtonText, QtCore.Qt.white)
+    palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
+    palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(33, 150, 243))
+    app.setPalette(palette)
+    
+    window = MainWindow()
+    window.resize(750, 650)
+    window.show()
     sys.exit(app.exec_())
 
 
